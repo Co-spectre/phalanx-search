@@ -12,11 +12,10 @@
 
 ## ✨ Features
 
-- 🔍 **Semantic Search** - Find documents by meaning, not just keywords
+- 🔍 **Simple Semantic Search** - Find documents by meaning, not just keywords
 - 📄 **Multi-Format Support** - PDF, Word, Excel, PowerPoint, Text files
 - 🔒 **100% Private** - All AI models run locally, no internet required after setup
-- ⚡ **Fast & Efficient** - Uses optimized vector search with ChromaDB
-- 🎨 **Beautiful UI** - Modern, responsive web interface
+- 🎨 **Minimal UI** - Clean, simple interface - no overwhelming features
 - 📊 **Smart Chunking** - Intelligent document splitting for accurate results
 
 ---
@@ -57,21 +56,20 @@ python run.py
 
 ### 1️⃣ Upload Documents
 
-- Go to the **"Upload Documents"** tab
-- Drag and drop files or click to browse
+- Upload files using the file uploader
+- Click "Upload & Index" to process them
 - Supported: PDF, DOCX, XLSX, PPTX, TXT, MD, CSV
 
 ### 2️⃣ Search
 
-- Go to the **"Search"** tab
-- Type your query in natural language
+- Type your query in the search box
+- Results appear automatically
 - Example: "quarterly sales report" or "employee contract terms"
 
 ### 3️⃣ Review Results
 
 - Results are ranked by relevance
 - Click to expand and see full content
-- Filter by file type in the sidebar
 
 ---
 
