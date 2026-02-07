@@ -1,7 +1,7 @@
 """
 Phalanx Search - Core Search Engine
-The heart of the document search system
-Combines document processing, embeddings, and vector search
+System-wide document search with hybrid semantic + full-text ranking.
+Combines document processing, embeddings, vector search, and tantivy BM25.
 """
 
 from typing import List, Dict, Optional
@@ -10,228 +10,225 @@ from pathlib import Path
 import uuid
 import shutil
 import re
+import threading
 from collections import Counter
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 console = Console()
 
-# Import our modules
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from config.settings import (
-    DOCUMENTS_DIR, CHUNK_SIZE, CHUNK_OVERLAP, 
-    DEFAULT_TOP_K, SIMILARITY_THRESHOLD, SUPPORTED_EXTENSIONS
+    DOCUMENTS_DIR, CHUNK_SIZE, CHUNK_OVERLAP,
+    DEFAULT_TOP_K, SIMILARITY_THRESHOLD, SUPPORTED_EXTENSIONS,
+    HYBRID_SEMANTIC_WEIGHT, HYBRID_KEYWORD_WEIGHT, HYBRID_EXACT_BONUS
 )
 from backend.parsers import DocumentParserFactory, ParsedDocument
 from backend.embeddings import embedding_service
-from backend.database import vector_store
+from backend.database import vector_store, text_index
 
 
 class KeywordExtractor:
-    """
-    Extracts keywords and generates summaries from documents
-    """
-    
-    # Common stop words to ignore
-    STOP_WORDS = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-                  'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
-                  'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                  'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought',
-                  'used', 'it', 'its', 'this', 'that', 'these', 'those', 'i', 'you', 'he',
-                  'she', 'we', 'they', 'what', 'which', 'who', 'whom', 'whose', 'where',
-                  'when', 'why', 'how', 'all', 'each', 'every', 'both', 'few', 'more',
-                  'most', 'other', 'some', 'such', 'no', 'not', 'only', 'own', 'same',
-                  'so', 'than', 'too', 'very', 'just', 'also', 'now', 'here', 'there'}
-    
+    """Extracts keywords and generates summaries from documents."""
+
+    STOP_WORDS = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
+        'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought',
+        'used', 'it', 'its', 'this', 'that', 'these', 'those', 'i', 'you', 'he',
+        'she', 'we', 'they', 'what', 'which', 'who', 'whom', 'whose', 'where',
+        'when', 'why', 'how', 'all', 'each', 'every', 'both', 'few', 'more',
+        'most', 'other', 'some', 'such', 'no', 'not', 'only', 'own', 'same',
+        'so', 'than', 'too', 'very', 'just', 'also', 'now', 'here', 'there',
+    }
+
     @classmethod
     def extract_keywords(cls, text: str, top_n: int = 20) -> List[str]:
-        """Extract top keywords from text using word frequency"""
-        # Clean and tokenize
         words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
-        
-        # Filter stop words and count
         filtered_words = [w for w in words if w not in cls.STOP_WORDS]
         word_counts = Counter(filtered_words)
-        
-        # Return top keywords
         return [word for word, _ in word_counts.most_common(top_n)]
-    
+
     @classmethod
     def generate_summary(cls, text: str, max_sentences: int = 3) -> str:
-        """Generate a brief summary by extracting key sentences"""
-        # Split into sentences
         sentences = re.split(r'[.!?]+', text)
         sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
-        
+
         if not sentences:
             return text[:500] + "..." if len(text) > 500 else text
-        
-        # Score sentences by keyword density
+
         keywords = set(cls.extract_keywords(text, top_n=15))
-        
-        scored_sentences = []
+        scored = []
         for sent in sentences:
             words = set(re.findall(r'\b[a-zA-Z]{3,}\b', sent.lower()))
             score = len(words & keywords)
-            scored_sentences.append((score, sent))
-        
-        # Get top sentences in original order
-        scored_sentences.sort(key=lambda x: x[0], reverse=True)
-        top_sentences = scored_sentences[:max_sentences]
-        
-        # Sort by original position
-        result_sentences = []
-        for _, sent in top_sentences:
-            for i, orig_sent in enumerate(sentences):
-                if sent == orig_sent:
-                    result_sentences.append((i, sent))
+            scored.append((score, sent))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = scored[:max_sentences]
+
+        result = []
+        for _, sent in top:
+            for i, orig in enumerate(sentences):
+                if sent == orig:
+                    result.append((i, sent))
                     break
-        
-        result_sentences.sort(key=lambda x: x[0])
-        summary = '. '.join([s for _, s in result_sentences])
-        
+
+        result.sort(key=lambda x: x[0])
+        summary = '. '.join([s for _, s in result])
         return summary + '.' if summary and not summary.endswith('.') else summary
 
 
 class TextChunker:
-    """Splits documents into searchable chunks"""
-    
+    """
+    Recursive text splitter — splits on natural boundaries.
+    Priority: paragraph → sentence → word → character.
+    """
+
     def __init__(self, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
         self.chunk_size = chunk_size
         self.overlap = overlap
-    
+
     def chunk_text(self, text: str, metadata: Dict = None) -> List[Dict]:
-        """
-        Split text into overlapping chunks
-        
-        Args:
-            text: Full document text
-            metadata: Metadata to attach to each chunk
-            
-        Returns:
-            List of chunk dictionaries with content and metadata
-        """
         if not text or not text.strip():
             return []
-        
-        chunks = []
+
         text = text.strip()
-        
-        # Simple sentence-aware chunking
-        sentences = text.replace('\n', ' ').split('. ')
-        
-        current_chunk = ""
-        chunk_index = 0
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            
-            # Add period back if it was removed
-            if not sentence.endswith('.'):
-                sentence += '.'
-            
-            # Check if adding this sentence exceeds chunk size
-            if len(current_chunk) + len(sentence) + 1 > self.chunk_size:
-                if current_chunk:
-                    chunks.append({
-                        "content": current_chunk.strip(),
-                        "chunk_index": chunk_index,
-                        "metadata": {**(metadata or {}), "chunk_index": chunk_index}
-                    })
-                    chunk_index += 1
-                    
-                    # Start new chunk with overlap
-                    words = current_chunk.split()
-                    overlap_words = words[-self.overlap:] if len(words) > self.overlap else words
-                    current_chunk = ' '.join(overlap_words) + ' ' + sentence
-                else:
-                    current_chunk = sentence
-            else:
-                current_chunk = current_chunk + ' ' + sentence if current_chunk else sentence
-        
-        # Don't forget the last chunk
-        if current_chunk.strip():
+        raw_chunks = self._recursive_split(text)
+
+        chunks = []
+        for i, chunk_text in enumerate(raw_chunks):
             chunks.append({
-                "content": current_chunk.strip(),
-                "chunk_index": chunk_index,
-                "metadata": {**(metadata or {}), "chunk_index": chunk_index}
+                "content": chunk_text.strip(),
+                "chunk_index": i,
+                "metadata": {**(metadata or {}), "chunk_index": i}
             })
-        
+
+        return chunks
+
+    def _recursive_split(self, text: str, _depth: int = 0) -> List[str]:
+        """Split text recursively using natural boundaries."""
+        if len(text) <= self.chunk_size:
+            return [text] if text.strip() else []
+
+        # Prevent infinite recursion
+        if _depth > 10:
+            chunks = []
+            for i in range(0, len(text), self.chunk_size - self.overlap):
+                chunk = text[i:i + self.chunk_size]
+                if chunk.strip():
+                    chunks.append(chunk)
+            return chunks
+
+        # Try splitting by decreasing boundary granularity
+        separators = ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " "]
+
+        for sep in separators:
+            parts = text.split(sep)
+            if len(parts) > 1:
+                chunks = self._merge_splits(parts, sep, _depth)
+                if chunks:
+                    return chunks
+
+        # Last resort: hard split at chunk_size
+        chunks = []
+        for i in range(0, len(text), self.chunk_size - self.overlap):
+            chunk = text[i:i + self.chunk_size]
+            if chunk.strip():
+                chunks.append(chunk)
+        return chunks
+
+    def _merge_splits(self, parts: List[str], sep: str, _depth: int = 0) -> List[str]:
+        """Merge small splits together until they reach chunk_size."""
+        chunks = []
+        current = ""
+
+        for part in parts:
+            candidate = current + sep + part if current else part
+
+            if len(candidate) > self.chunk_size:
+                if current.strip():
+                    chunks.append(current.strip())
+                # Overlap: carry some text forward
+                if self.overlap > 0 and current:
+                    overlap_text = current[-self.overlap:]
+                    current = overlap_text + sep + part
+                else:
+                    current = part
+
+                # If single part exceeds chunk_size, recurse
+                if len(current) > self.chunk_size:
+                    sub_chunks = self._recursive_split(current, _depth + 1)
+                    if len(sub_chunks) > 1:
+                        chunks.extend(sub_chunks[:-1])
+                        current = sub_chunks[-1]
+            else:
+                current = candidate
+
+        if current.strip():
+            chunks.append(current.strip())
+
         return chunks
 
 
 class SearchEngine:
     """
-    Main search engine class
-    Handles document ingestion, indexing, and searching
-    Supports both semantic search and keyword-based search
+    Main search engine.
+    Handles document ingestion, indexing, and hybrid search.
+    Integrates ChromaDB (semantic) + Tantivy (full-text BM25).
+    Thread-safe for concurrent access from crawler and UI.
     """
-    
+
     def __init__(self):
         self.chunker = TextChunker()
         self.keyword_extractor = KeywordExtractor()
         self.embedding_service = embedding_service
         self.vector_store = vector_store
-    
+        self.text_index = text_index
+        self._index_lock = threading.Lock()
+
     def index_document(self, filepath: str, copy_to_storage: bool = False) -> Dict:
         """
-        Index a document: parse, chunk, embed, and store
-        
-        Args:
-            filepath: Path to the document file
-            copy_to_storage: Whether to copy file to internal storage (default: False - use original location)
-            
-        Returns:
-            Dictionary with indexing results
+        Index a document: parse, chunk, embed, and store.
+        Thread-safe — can be called from crawler workers.
         """
-        filepath = Path(filepath).resolve()  # Get absolute path
-        
-        # Validate file exists
+        filepath = Path(filepath).resolve()
+
         if not filepath.exists():
             return {"success": False, "error": "File not found"}
-        
-        # Check if file type is supported
+
         if not DocumentParserFactory.is_supported(str(filepath)):
             return {
-                "success": False, 
+                "success": False,
                 "error": f"Unsupported file type: {filepath.suffix}",
-                "supported_types": list(SUPPORTED_EXTENSIONS.keys())
             }
-        
-        console.print(f"\n[bold cyan]📄 Indexing: {filepath.name}[/bold cyan]")
-        console.print(f"[dim]  ├─ Location: {filepath}[/dim]")
-        
+
+        console.print(f"[dim]📄 Indexing: {filepath.name}[/dim]")
+
         try:
             # Step 1: Parse document
-            console.print("[dim]  ├─ Parsing document...[/dim]")
             parsed_doc = DocumentParserFactory.parse_document(str(filepath))
-            
+
             if not parsed_doc or not parsed_doc.content:
                 return {"success": False, "error": "Could not extract text from document"}
-            
-            console.print(f"[dim]  ├─ Extracted {len(parsed_doc.content)} characters[/dim]")
-            
-            # Use original file location (no copying by default)
+
             storage_path = filepath
             if copy_to_storage:
                 storage_path = DOCUMENTS_DIR / filepath.name
                 if not storage_path.exists():
                     shutil.copy2(filepath, storage_path)
-            
-            # Step 2: Extract keywords and generate summary
-            console.print("[dim]  ├─ Extracting keywords & summary...[/dim]")
+
+            # Step 2: Extract keywords and summary
             keywords = KeywordExtractor.extract_keywords(parsed_doc.content, top_n=30)
             summary = KeywordExtractor.generate_summary(parsed_doc.content, max_sentences=3)
-            
-            # Step 3: Create chunks - store ORIGINAL file path
-            console.print("[dim]  ├─ Creating chunks...[/dim]")
+
+            # Step 3: Create chunks
             base_metadata = {
                 "filename": filepath.name,
-                "filepath": str(storage_path),  # Original location
+                "filepath": str(storage_path),
                 "file_type": parsed_doc.file_type,
                 "file_size": parsed_doc.file_size,
                 "page_count": parsed_doc.page_count,
@@ -241,43 +238,49 @@ class SearchEngine:
                 "summary": summary[:500],
                 "full_text_preview": parsed_doc.content[:1000]
             }
-            
+
             chunks = self.chunker.chunk_text(parsed_doc.content, base_metadata)
-            console.print(f"[dim]  ├─ Created {len(chunks)} chunks[/dim]")
-            
+
             if not chunks:
                 return {"success": False, "error": "No chunks created from document"}
-            
+
             # Step 4: Generate embeddings
-            console.print("[dim]  ├─ Generating embeddings (100% local)...[/dim]")
             chunk_contents = [chunk["content"] for chunk in chunks]
             embeddings = self.embedding_service.embed_texts(chunk_contents)
-            
-            # Step 5: Store in vector database
-            console.print("[dim]  └─ Storing in vector database...[/dim]")
-            
-            doc_ids = []
-            metadatas = []
-            
-            for i, chunk in enumerate(chunks):
-                doc_id = f"{parsed_doc.doc_hash}_{i}"
-                doc_ids.append(doc_id)
-                metadatas.append(chunk["metadata"])
-            
-            success = self.vector_store.add_documents_batch(
-                doc_ids=doc_ids,
-                contents=chunk_contents,
-                embeddings=embeddings,
-                metadatas=metadatas
-            )
-            
+
+            # Step 5: Store in both indexes (thread-safe)
+            with self._index_lock:
+                doc_ids = []
+                metadatas = []
+
+                for i, chunk in enumerate(chunks):
+                    doc_id = f"{parsed_doc.doc_hash}_{i}"
+                    doc_ids.append(doc_id)
+                    metadatas.append(chunk["metadata"])
+
+                # Vector store (semantic search)
+                success = self.vector_store.add_documents_batch(
+                    doc_ids=doc_ids,
+                    contents=chunk_contents,
+                    embeddings=embeddings,
+                    metadatas=metadatas
+                )
+
+                # Full-text index (BM25 keyword search)
+                self.text_index.add_documents_batch(
+                    doc_ids=doc_ids,
+                    contents=chunk_contents,
+                    filenames=[filepath.name] * len(doc_ids),
+                    keywords_list=[",".join(keywords[:20])] * len(doc_ids),
+                    file_types=[parsed_doc.file_type] * len(doc_ids),
+                    filepaths=[str(storage_path)] * len(doc_ids),
+                )
+
             if success:
-                console.print(f"[bold green]✅ Successfully indexed: {filepath.name}[/bold green]")
-                console.print(f"[dim]   Original location preserved: {filepath}[/dim]")
                 return {
                     "success": True,
                     "filename": filepath.name,
-                    "filepath": str(filepath),  # Return original path
+                    "filepath": str(filepath),
                     "chunks_created": len(chunks),
                     "file_type": parsed_doc.file_type,
                     "page_count": parsed_doc.page_count,
@@ -286,44 +289,38 @@ class SearchEngine:
                 }
             else:
                 return {"success": False, "error": "Failed to store in vector database"}
-                
+
         except Exception as e:
-            console.print(f"[bold red]❌ Error indexing document: {e}[/bold red]")
+            console.print(f"[red]❌ Error indexing {filepath.name}: {e}[/red]")
             return {"success": False, "error": str(e)}
-    
+
     def index_directory(self, directory: str) -> Dict:
-        """
-        Index all supported documents in a directory
-        
-        Args:
-            directory: Path to directory containing documents
-            
-        Returns:
-            Summary of indexing results
-        """
+        """Index all supported documents in a directory."""
         directory = Path(directory)
-        
+
         if not directory.exists():
             return {"success": False, "error": "Directory not found"}
-        
-        # Find all supported files
+
         files = []
         for ext in SUPPORTED_EXTENSIONS.keys():
             files.extend(directory.glob(f"*{ext}"))
-            files.extend(directory.glob(f"**/*{ext}"))  # Recursive
-        
+            files.extend(directory.glob(f"**/*{ext}"))
+
+        # Deduplicate
+        files = list({str(f.resolve()): f for f in files}.values())
+
         if not files:
             return {"success": False, "error": "No supported documents found"}
-        
-        console.print(f"\n[bold cyan]📁 Found {len(files)} documents to index[/bold cyan]")
-        
+
+        console.print(f"[bold cyan]📁 Found {len(files)} documents to index[/bold cyan]")
+
         results = {
             "total_files": len(files),
             "successful": 0,
             "failed": 0,
             "details": []
         }
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -332,7 +329,7 @@ class SearchEngine:
             console=console
         ) as progress:
             task = progress.add_task("Indexing...", total=len(files))
-            
+
             for file in files:
                 result = self.index_document(str(file))
                 results["details"].append({
@@ -340,17 +337,17 @@ class SearchEngine:
                     "success": result.get("success", False),
                     "error": result.get("error")
                 })
-                
+
                 if result.get("success"):
                     results["successful"] += 1
                 else:
                     results["failed"] += 1
-                
+
                 progress.update(task, advance=1)
-        
-        console.print(f"\n[bold green]✅ Indexing complete: {results['successful']}/{results['total_files']} successful[/bold green]")
+
+        console.print(f"[bold green]✅ Indexing complete: {results['successful']}/{results['total_files']}[/bold green]")
         return results
-    
+
     def search(
         self,
         query: str,
@@ -360,116 +357,150 @@ class SearchEngine:
         search_mode: str = "hybrid"
     ) -> List[Dict]:
         """
-        Search for documents matching the query
-        
-        Args:
-            query: Natural language search query
-            top_k: Number of results to return
-            file_type_filter: Filter by file type (pdf, docx, etc.)
-            filename_filter: Filter by filename (partial match)
-            search_mode: 'semantic', 'keyword', or 'hybrid' (default)
-            
-        Returns:
-            List of matching document chunks with metadata
+        Search for documents matching the query.
+        Hybrid mode: merges semantic (ChromaDB) + full-text (Tantivy) results.
         """
         if not query or not query.strip():
             return []
-        
-        console.print(f"\n[bold cyan]🔍 Searching ({search_mode}): \"{query}\"[/bold cyan]")
-        
-        # Generate query embedding for semantic search
-        query_embedding = self.embedding_service.embed_text(query)
-        
-        # Build metadata filter
+
+        # 1. Semantic search (ChromaDB)
+        query_embedding = self.embedding_service.embed_query(query)
+
         metadata_filter = None
         if file_type_filter:
             metadata_filter = {"file_type": file_type_filter}
-        
-        # Search vector store (semantic search)
-        results = self.vector_store.search(
+
+        semantic_results = self.vector_store.search(
             query_embedding=query_embedding,
-            top_k=top_k * 3,  # Get more results for hybrid filtering
+            top_k=top_k * 3,
             filter_metadata=metadata_filter
         )
-        
-        # Extract query keywords for keyword matching
+
+        # 2. Full-text search (Tantivy BM25)
+        text_results = self.text_index.search(query, top_k=top_k * 3)
+
+        # 3. Merge results using Reciprocal Rank Fusion (RRF)
         query_lower = query.lower()
         query_words = set(re.findall(r'\b[a-zA-Z]{2,}\b', query_lower))
-        
-        # Apply additional filters, keyword boosting, and deduplication
+
+        # Build a merged result map keyed by doc_id
+        merged: Dict[str, Dict] = {}
         seen_content = set()
-        scored_results = []
-        
-        for result in results:
-            # Skip very low-score results
-            if result["score"] < SIMILARITY_THRESHOLD * 0.5:
+
+        # Process semantic results
+        for rank, result in enumerate(semantic_results):
+            if result["score"] < SIMILARITY_THRESHOLD * 0.3:
                 continue
-            
-            # Filename filter
-            if filename_filter:
-                if filename_filter.lower() not in result["metadata"].get("filename", "").lower():
-                    continue
-            
-            # Content deduplication (skip near-duplicates)
-            content_hash = hash(result["content"][:100])
+
+            content_hash = hash(result["content"][:150])
             if content_hash in seen_content:
                 continue
             seen_content.add(content_hash)
-            
-            # Calculate keyword match score
-            content_lower = result["content"].lower()
-            keywords_str = result["metadata"].get("keywords", "").lower()
-            
-            keyword_matches = sum(1 for word in query_words if word in content_lower or word in keywords_str)
+
+            doc_id = result["id"]
+            merged[doc_id] = {
+                **result,
+                "semantic_score": result["score"],
+                "semantic_rank": rank + 1,
+                "bm25_score": 0.0,
+                "bm25_rank": 9999,
+            }
+
+        # Process text results
+        for rank, result in enumerate(text_results):
+            doc_id = result.get("doc_id", "")
+            if doc_id in merged:
+                merged[doc_id]["bm25_score"] = result.get("bm25_score", 0.0)
+                merged[doc_id]["bm25_rank"] = rank + 1
+            else:
+                content_hash = hash(result.get("content", "")[:150])
+                if content_hash in seen_content:
+                    continue
+                seen_content.add(content_hash)
+
+                merged[doc_id] = {
+                    "id": doc_id,
+                    "content": result.get("content", ""),
+                    "metadata": {
+                        "filename": result.get("filename", ""),
+                        "filepath": result.get("filepath", ""),
+                        "file_type": result.get("file_type", ""),
+                        "keywords": result.get("keywords", ""),
+                    },
+                    "semantic_score": 0.0,
+                    "semantic_rank": 9999,
+                    "bm25_score": result.get("bm25_score", 0.0),
+                    "bm25_rank": rank + 1,
+                    "score": 0.0,
+                }
+
+        # 4. Compute final scores
+        k = 60  # RRF constant
+        scored_results = []
+
+        for doc_id, result in merged.items():
+            # Filter by filename if specified
+            if filename_filter:
+                if filename_filter.lower() not in result.get("metadata", {}).get("filename", "").lower():
+                    continue
+
+            content_lower = result.get("content", "").lower()
+            keywords_str = result.get("metadata", {}).get("keywords", "").lower()
+
+            # Exact match detection
             exact_phrase_match = query_lower in content_lower
-            
-            # Hybrid scoring: combine semantic and keyword scores
-            semantic_score = result["score"]
-            keyword_score = min(keyword_matches / max(len(query_words), 1), 1.0)
-            exact_bonus = 0.3 if exact_phrase_match else 0.0
-            
+            keyword_matches = sum(1 for w in query_words if w in content_lower or w in keywords_str)
+
+            sem_score = result.get("semantic_score", 0.0)
+            sem_rank = result.get("semantic_rank", 9999)
+            bm25_rank = result.get("bm25_rank", 9999)
+
             if search_mode == "semantic":
-                final_score = semantic_score
+                final_score = sem_score
             elif search_mode == "keyword":
-                final_score = keyword_score + exact_bonus
-            else:  # hybrid
-                final_score = (semantic_score * 0.6) + (keyword_score * 0.3) + exact_bonus
-            
-            result["score"] = round(min(final_score, 1.0), 4)
+                # Use reciprocal rank from BM25 + exact match bonus
+                final_score = (1.0 / (k + bm25_rank)) + (HYBRID_EXACT_BONUS if exact_phrase_match else 0)
+            else:
+                # Hybrid: Reciprocal Rank Fusion + exact match bonus
+                rrf_semantic = 1.0 / (k + sem_rank)
+                rrf_keyword = 1.0 / (k + bm25_rank)
+                rrf_score = (HYBRID_SEMANTIC_WEIGHT * rrf_semantic) + (HYBRID_KEYWORD_WEIGHT * rrf_keyword)
+
+                # Normalize RRF to 0-1 range (max possible = weight / (k+1))
+                max_rrf = (HYBRID_SEMANTIC_WEIGHT + HYBRID_KEYWORD_WEIGHT) / (k + 1)
+                final_score = rrf_score / max_rrf if max_rrf > 0 else 0
+
+                # Boost with exact match and direct semantic score
+                if exact_phrase_match:
+                    final_score = min(1.0, final_score + HYBRID_EXACT_BONUS)
+
+                # Blend in raw semantic similarity
+                final_score = 0.6 * final_score + 0.4 * sem_score
+
+            result["score"] = round(min(1.0, max(0.0, final_score)), 4)
             result["keyword_matches"] = keyword_matches
             result["exact_match"] = exact_phrase_match
-            
             scored_results.append(result)
-        
-        # Sort by final score
+
+        # 5. Sort and filter
         scored_results.sort(key=lambda x: x["score"], reverse=True)
-        
-        # Filter by threshold only - no result limit
-        filtered_results = [
-            result for result in scored_results
-            if result["score"] >= SIMILARITY_THRESHOLD or result.get("exact_match")
+
+        filtered = [
+            r for r in scored_results
+            if r["score"] >= SIMILARITY_THRESHOLD or r.get("exact_match")
         ]
-        
-        console.print(f"[dim]Found {len(filtered_results)} relevant results[/dim]")
-        
-        return filtered_results
-    
+
+        return filtered[:top_k]
+
     def keyword_search(self, keyword: str, top_k: int = DEFAULT_TOP_K) -> List[Dict]:
-        """
-        Search for exact keyword matches in documents
-        """
         return self.search(keyword, top_k=top_k, search_mode="keyword")
-    
+
     def get_document_info(self, filename: str) -> Optional[Dict]:
-        """
-        Get detailed information about a specific document including summary and keywords
-        """
         try:
             results = self.vector_store._collection.get(
                 where={"filename": filename},
                 include=["metadatas", "documents"]
             )
-            
             if results and results['ids']:
                 metadata = results['metadatas'][0] if results['metadatas'] else {}
                 return {
@@ -486,39 +517,38 @@ class SearchEngine:
                 }
             return None
         except Exception as e:
-            console.print(f"[bold red]Error getting document info: {e}[/bold red]")
             return None
-    
+
     def delete_document(self, filename: str) -> Dict:
-        """Delete a document from the index (does NOT delete original file)"""
+        """Delete a document from all indexes."""
         deleted_count = self.vector_store.delete_by_filename(filename)
-        
-        # Don't delete original files - just remove from index
-        # Original files stay where they are
-        
+        self.text_index.delete_by_filename(filename)
         return {
             "success": deleted_count > 0,
             "filename": filename,
             "chunks_deleted": deleted_count
         }
-    
+
     def get_indexed_documents(self) -> List[Dict]:
-        """Get list of all indexed documents"""
         return self.vector_store.get_all_documents()
-    
+
     def get_stats(self) -> Dict:
-        """Get search engine statistics"""
         db_stats = self.vector_store.get_stats()
+        text_stats = self.text_index.get_stats()
         return {
             **db_stats,
+            "text_index": text_stats,
             "embedding_model": self.embedding_service.model_name,
             "embedding_dimension": self.embedding_service.dimension,
+            "embedding_device": self.embedding_service.device,
             "supported_file_types": list(SUPPORTED_EXTENSIONS.keys())
         }
-    
+
     def clear_index(self) -> bool:
-        """Clear all indexed documents"""
-        return self.vector_store.clear_all()
+        """Clear all indexes."""
+        v = self.vector_store.clear_all()
+        t = self.text_index.clear_all()
+        return v
 
 
 # Global search engine instance

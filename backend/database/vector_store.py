@@ -1,7 +1,7 @@
 """
 Phalanx Search - Vector Database Service
-Uses ChromaDB for 100% local vector storage
-All data stays on your machine - completely private
+Uses ChromaDB for 100% local vector storage.
+All data stays on your machine — completely private.
 """
 
 import chromadb
@@ -13,7 +13,6 @@ from rich.console import Console
 
 console = Console()
 
-# Import settings
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -22,48 +21,49 @@ from config.settings import CHROMA_COLLECTION_NAME, CHROMA_PERSIST_DIR
 
 class VectorStore:
     """
-    Local vector database using ChromaDB
-    All data is stored locally - no cloud services used
+    Local vector database using ChromaDB.
+    All data is stored locally — no cloud services used.
+    Uses cosine similarity for normalized embeddings.
     """
-    
+
     _instance = None
     _client = None
     _collection = None
-    
+
     def __new__(cls):
-        """Singleton pattern"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
-    
+
     def __init__(self):
         if self._client is None:
             self._initialize_db()
-    
+
     def _initialize_db(self):
-        """Initialize ChromaDB with persistent storage"""
+        """Initialize ChromaDB with persistent storage."""
         console.print(f"[bold blue]🗄️ Initializing local vector database...[/bold blue]")
-        console.print(f"[dim]Storage location: {CHROMA_PERSIST_DIR}[/dim]")
-        
+
         try:
-            # Create persistent client
             self._client = chromadb.PersistentClient(
                 path=CHROMA_PERSIST_DIR,
                 settings=Settings(
-                    anonymized_telemetry=False,  # Disable telemetry for privacy
+                    anonymized_telemetry=False,
                     allow_reset=True
                 )
             )
-            
-            # Get or create collection
+
+            # Use cosine distance for normalized embeddings (BGE models)
             self._collection = self._client.get_or_create_collection(
                 name=CHROMA_COLLECTION_NAME,
-                metadata={"description": "Phalanx document embeddings"}
+                metadata={
+                    "description": "Phalanx document embeddings",
+                    "hnsw:space": "cosine",
+                }
             )
-            
+
             console.print(f"[bold green]✅ Vector database ready![/bold green]")
             console.print(f"[dim]Collection: {CHROMA_COLLECTION_NAME} | Documents: {self._collection.count()}[/dim]")
-            
+
         except Exception as e:
             console.print(f"[bold red]❌ Error initializing database: {e}[/bold red]")
             raise
@@ -176,10 +176,10 @@ class VectorStore:
             
             if results and results['ids'] and results['ids'][0]:
                 for i, doc_id in enumerate(results['ids'][0]):
-                    # Convert distance to similarity score (ChromaDB uses L2 distance)
+                    # Cosine distance → similarity: sim = 1 - distance
                     distance = results['distances'][0][i] if results['distances'] else 0
-                    similarity = 1 / (1 + distance)  # Convert distance to similarity
-                    
+                    similarity = max(0.0, 1.0 - distance)
+
                     formatted_results.append({
                         "id": doc_id,
                         "content": results['documents'][0][i] if results['documents'] else "",
